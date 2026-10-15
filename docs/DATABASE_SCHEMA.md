@@ -1,16 +1,17 @@
 # Database Schema (Logic) — Shop App Crawler
 
-**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.2 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt (vòng cuối)
 
 DDL vật lý: `SQLITE_SCHEMA.sql` (SQLite), `PARQUET_SCHEMAS.md` (Parquet).
 Từ điển field: `DATA_DICTIONARY.md`.
 
-**v1.1 corrections:** (1) mọi `observed_at` là TIMESTAMP UTC (microsecond),
-không còn DATE — phân biệt được nhiều lần quan sát trong ngày;
-(2) tách `fetch_status` (truy cập) khỏi `review_status` (dữ liệu);
-(3) bảng priority scheduling (design, chưa thuật toán);
-(4) review identity nhiều tầng, không mặc định hash = ID ổn định;
-(5) `current/` đảm bảo đúng 1 dòng/product_id về mặt vật lý.
+**v1.2 corrections (final review):**
+(1) `observation_id` ổn định + thứ tự xác định `(observed_at, observation_id)`;
+idempotent replay theo batch; (2) DQ R14 viết lại — hết mâu thuẫn với `NO_REVIEWS`;
+(3) `current/` publication nguyên tử qua **generation manifest**;
+(4) recovery protocol SQLite↔Parquet (staging → parquet → sqlite);
+(5) `explore_budget_pct` mặc định **15%** (APPROVED, cấu hình được);
+(6) review count **giảm thật được ghi nhận** (không clamp).
 
 Quy ước khóa (dùng nhất quán mọi nơi):
 - `merchant_key TEXT` — token trong `/m/<token>` (vd `dogecore`). PK bảng merchants.
@@ -77,9 +78,14 @@ Dedup: PK `collection_key`; UNIQUE(merchant_key, collection_id) dự phòng.
 | source_surface | TEXT | NOT NULL | Surface của lần success gần nhất |
 | collector_version, parser_version | TEXT | NOT NULL | |
 
-**Bất biến quan trọng:** `fetch_status != 'OK'` **KHÔNG ĐƯỢC** thay đổi
+**Bất biến quan trọng (APPROVED):** `fetch_status != 'OK'` **KHÔNG ĐƯỢC** thay đổi
 `review_count`/`rating_avg`/`review_status` — chỉ cập nhật `fetch_status` và
 `last_attempt_at`. HTTP 403 là sự kiện truy cập, không phải sự kiện dữ liệu.
+
+**Quy tắc upsert (APPROVED):** chỉ một lần quan sát dữ liệu **thành công** mới được
+cập nhật 3 trường trên — **kể cả khi giá trị giảm thật** (vd count 2700→2400 được
+ghi nhận nguyên vẹn, đồng thời ghi `field_changes`; không clamp, không coi là nhiễu).
+Upsert có tính idempotent: chỉ áp dụng khi `observed_at` mới hơn `last_success_at`.
 
 Ngữ nghĩa data state:
 - `UNKNOWN`: chưa từng quan sát review data (kể cả đã thử fetch nhưng fail).
@@ -108,8 +114,20 @@ Một dòng cho mỗi (collection, job) — đầu vào của Merchant Feedback 
 ### 1.6 crawl_policy — knobs scheduling (mới, v1.1, design)
 
 `(policy_key TEXT PK, policy_value TEXT, updated_at TIMESTAMP)`.
-Keys dự kiến: `explore_budget_pct`, `score_version`, `reward_thresholds`,
-`max_targets_per_job`, `collection_batch_size`. Giá trị cụ thể là việc tương lai.
+Seed defaults (**APPROVED** 2026-10-15, cấu hình được, hiệu chỉnh sau benchmark):
+
+| policy_key | policy_value | Ghi chú |
+|---|---|---|
+| `explore_budget_pct` | `15` | % mỗi batch dành cho target chưa/low-priority (chống starvation) |
+| `score_version` | `v0` | Version công thức Collection Priority Score |
+| `reward_thresholds` | `[1,10,50,100]` | Vector R_T |
+| `max_targets_per_job` | `1000000` | Trần queue window |
+
+### 1.7 ingest_batches — checkpoint ingest chống crash (mới, v1.2)
+
+`(batch_key TEXT PK` = `<job_id>:<batch_seq>`, `job_id FK`, `status` ∈
+`STAGED|PARQUET_DONE|COMPLETE`, `parquet_path`, `rows_count`, `created_at`,
+`completed_at)`. Xem quy trình recovery ở mục 6.
 
 ### 1.7 crawl_targets — queue window ~1M + priority (v1.1)
 
@@ -133,8 +151,23 @@ Thay đổi chung: mọi `observed_at` → **TIMESTAMP**; partition giữ cột 
 ### 2.2 lake/products — snapshots: GIỮ MỌI QUAN SÁT (v1.1, sửa dedup)
 
 Mỗi dòng = một quan sát. **Không dedup lúc ingest** — cùng `product_id` quan sát
-3 lần/ngày thì lưu 3 dòng (TIMESTAMP phân biệt được). Dedup chỉ xảy ra lúc
-compaction vào `current/`.
+3 lần/ngày thì lưu 3 dòng.
+
+**Định danh quan sát (v1.2):** không dùng `(product_id, observed_at)` làm key —
+TIMESTAMP có thể trùng (clock skew, batch cùng microsecond).
+
+| Cột | Kiểu | Ghi chú |
+|---|---|---|
+| observation_id | TEXT NOT NULL | **Định danh ổn định**: `<job_id>:<batch_seq>:<row_seq>` (vd `1042:000137:000012`). Gán 1 lần lúc ingest, không bao giờ tính lại |
+| product_id | BIGINT NOT NULL | |
+| observed_at | TIMESTAMP NOT NULL | Gán lúc **fetch** (crawler), ingest giữ nguyên → replay an toàn |
+
+**Thứ tự xác định:** `ORDER BY observed_at, observation_id` — total order vì
+`observation_id` unique. Mọi consumer (compaction, diff, export) dùng thứ tự này.
+
+**Idempotent replay:** file Parquet đặt tên xác định `part-<job_id>-<batch>.parquet`.
+Replay batch đã xong → file đã tồn tại → **skip**, không tạo observations trùng.
+`ingest_batches` ghi nhận trạng thái từng batch.
 
 `(product_id BIGINT, url, title, price DOUBLE, currency, image_url, image_alt,
 review_count BIGINT NULL, rating_avg DOUBLE NULL, observed_at TIMESTAMP,
@@ -179,39 +212,79 @@ Nội dung bị sửa: identity match + `content_sha256` đổi → dòng mới 
 `(product_id, observed_at TIMESTAMP)` — mọi thay đổi trong cùng ngày đều được ghi,
 không gộp theo ngày.
 
-### 2.8 current/ — ĐÚNG MỘT DÒNG/product_id (v1.1, sửa #6)
+### 2.8 current/ — ĐÚNG MỘT DÒNG/product_id + PUBLICATION NGUYÊN TỬ (v1.2)
 
 ```
-current/bucket-000.parquet … bucket-255.parquet   (KHÔNG partition ym)
+current/
+  generations/
+    gen_0001/bucket-000.parquet … bucket-255.parquet   # chỉ bucket được rewrite
+    gen_0002/...
+  manifests/
+    manifest_gen_0001.json …    # đủ 256 buckets/generation (file có thể trỏ về gen cũ)
+  current_latest.json           # {"generation": "gen_0007"} — con trỏ nguyên tử
 ```
 
-- Mỗi bucket file chứa **đúng một dòng cho mỗi product_id** thuộc bucket đó —
-  bất biến này do **writer đảm bảo**, không phải do query dedup.
-- Compaction mỗi bucket: đọc bucket file cũ + deltas mới của bucket (predicate
-  pushdown `product_id % 256 == b`) → dedup `ORDER BY observed_at DESC` → **ghi
-  file mới, đổi tên nguyên tử**. Crash giữa chừng: file cũ còn nguyên.
-- `current_manifest.json`: `{bucket, file, rows, max_observed_at, compacted_at}`
-  cho mỗi bucket — phục vụ crash recovery của chính compaction và backup manifest.
-- Query đọc `current/bucket-*.parquet` **không cần dedup lại** (DQ R15 kiểm tra).
-- Lịch sử theo tháng không nằm ở `current/` — nằm ở `lake/` (bất biến).
+- Mỗi generation là **snapshot nhất quán**: manifest liệt kê đủ 256 buckets;
+  bucket không đổi trỏ về file của generation trước (không copy).
+- Publication = **atomic rename** `current_latest.json`. Crash giữa lúc ghi bucket →
+  con trỏ chưa đổi → reader vẫn thấy generation cũ nhất quán. **Không bao giờ lộ
+  snapshot lẫn lộn nhiều generation.**
+- Staging ghi vào `generations/<gen>/` trước; dọn staging mồ côi (>24h, không được
+  manifest nào trỏ) bằng job dọn dẹp.
+- `current_manifest.json` cũ thay bằng `manifests/manifest_<gen>.json` +
+  `current_latest.json`. Chi tiết: `PARTITION_AND_COMPACTION.md`.
 
 ---
 
 ## 3. Quan hệ & cardinality — không đổi (xem ENTITY_RELATIONSHIP.md),
 thêm: `collections 1—n collection_crawl_stats`, `crawl_jobs 1—n collection_crawl_stats`.
 
-## 4. Dedup tổng hợp (v1.1)
+## 4. Dedup tổng hợp (v1.2)
 
 | Thực thể | Khóa dedup | Chiến lược |
 |---|---|---|
 | merchants/collections | PK tự nhiên | Upsert, mới thắng |
-| products (lake) | **không dedup lúc ingest** | Giữ mọi quan sát (TIMESTAMP phân biệt); dedup chỉ ở compaction |
-| products (current/) | `product_id` | Writer đảm bảo 1 dòng; atomic replace theo bucket |
-| product_review_state | `product_id` | Upsert; fail fetch không đụng data columns |
+| products (lake) | `observation_id` (`<job_id>:<batch>:<row>`) | **Không dedup** — mỗi quan sát 1 dòng; replay idempotent theo tên file batch |
+| products (current/) | `product_id` trong 1 generation | Writer đảm bảo 1 dòng; publication nguyên tử qua generation manifest |
+| product_review_state | `product_id` | Upsert idempotent: chỉ áp dụng khi `observed_at` mới hơn `last_success_at`; giảm thật được ghi nhận |
 | edges P–C / P–M | composite + timestamp | Append observations |
 | images | `(product_id, image_url)` | Bỏ qua trùng |
 | reviews (future) | identity nhiều tầng (§2.6) | Không mặc định hash = ID |
 | conflicts | — | Ghi `field_changes`, mới nhất thắng ở current |
+
+## 6. Crash recovery: SQLite ↔ Parquet (v1.2)
+
+Thứ tự ghi chuẩn cho mỗi batch (bắt buộc):
+
+```
+1. STAGE:   crawler ghi observations thô → ingest_staging/<job_id>/batch-<n>.jsonl + fsync
+            → INSERT ingest_batches(batch_key, status='STAGED')
+2. PARQUET: convert staging → lake/.../part-<job_id>-<batch>.parquet
+            (file đã tồn tại → SKIP — idempotent)
+            → UPDATE ingest_batches SET status='PARQUET_DONE'
+3. SQLITE:  transaction: upsert product_review_state (idempotent theo observed_at),
+            targets → DONE, checkpoint job
+            → UPDATE ingest_batches SET status='COMPLETE'
+4. CLEAN:   xóa staging file
+```
+
+Phân tích 2 chiều crash:
+
+| Crash tại | Hậu quả | Phục hồi (lúc khởi động) |
+|---|---|---|
+| Sau (1), trước (2) | Staging có, Parquet chưa | Replay từ staging → (2)(3)(4). Không mất data |
+| Sau (2), trước (3) | **Parquet có, SQLite chưa** | Quét batch `PARQUET_DONE` chưa `COMPLETE` → chạy lại (3) từ chính file Parquet (upsert idempotent). Không duplicate observations vì Parquet không ghi lại |
+| Sau (3), trước (4) | SQLite xong, staging còn | Batch đã `COMPLETE` → chỉ xóa staging thừa |
+| Giữa (3) | Transaction SQLite | WAL atomicity: commit hoặc không — không có trạng thái nửa vời |
+
+Nguyên tắc vàng: **lake là source of truth có thể replay; SQLite suy ra được từ lake,
+không bao giờ ngược lại.** Mọi bước đều idempotent nên replay không tạo duplicate
+ngoài ý muốn.
+
+Trường hợp "SQLite checkpoint đã cập nhật nhưng Parquet chưa commit" **không thể xảy ra**
+trong luồng chuẩn (SQLite luôn sau Parquet). Nếu xảy ra do can thiệp thủ công, quy trình
+phục hồi: staging còn → ghi Parquet → xong; staging mất → đánh dấu batch `FAILED`,
+cho crawl lại (observations mới, không ghi đè).
 
 ## 5. Sheets export spec — THIẾT KẾ, CHƯA TRIỂN KHAI
 

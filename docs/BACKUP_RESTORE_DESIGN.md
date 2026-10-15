@@ -1,9 +1,9 @@
 # Backup & Restore Design — Shop App Crawler
 
-**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.2 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt (vòng cuối)
 
-v1.1: backup manifest bao gồm `current_manifest.json` (để restore kiểm tra
-tính đầy đủ của `current/`).
+v1.2: backup manifest tham chiếu **generation** của `current/` (nhất quán);
+thêm `current_latest.json` + generation manifests vào manifest.
 
 Tương thích `docs/storage-architecture.md` mục 4–9 (đã APPROVED):
 MD5-vs-md5Checksum tại upload · SHA-256 post-restore · manifest = snapshot nhất quán ·
@@ -41,8 +41,13 @@ manifest chưa chốt = snapshot chưa tồn tại → chạy lại từ đầu,
   "schema_version": "1.0",
   "sqlite": {"path": "state/crawl_state-20261015.db",
              "md5": "...", "sha256": "...", "bytes": 12345},
-  "current_manifest": {"path": "current/current_manifest.json",
+  "current_manifest": {"path": "current/current_latest.json",
              "md5": "...", "sha256": "..."},
+  "current_generation": "gen_0007",
+  "generation_manifests": [
+    {"path": "current/manifests/manifest_gen_0007.json",
+     "md5": "...", "sha256": "..."}
+  ],
   "parquet": [
     {"path": "lake/products/crawl_date=2026-10-15/part-0000.parquet",
      "md5": "...", "sha256": "...", "bytes": 134217728, "rows": 812340}
@@ -68,8 +73,10 @@ manifest chưa chốt = snapshot chưa tồn tại → chạy lại từ đầu,
 2. Tải toàn bộ file trong manifest về thư mục TRỐNG.
 3. SHA-256 từng file == manifest (100% khớp, 1 file lệch = fail toàn bộ).
 4. Đặt đúng bố cục; SQLite: PRAGMA integrity_check.
-5. Spot-check: COUNT(*) vs manifest.rows; biên observed_at.
-6. Drill định kỳ mỗi quý vào thư mục trống (không đè dữ liệu chạy).
+5. Kiểm tra generation: current_latest.json trỏ generation có manifest đầy đủ
+   256 buckets (DQ R19) — restore không bao giờ dựng current/ lẫn lộn.
+6. Spot-check: COUNT(*) vs manifest.rows; biên observed_at.
+7. Drill định kỳ mỗi quý vào thư mục trống (không đè dữ liệu chạy).
 ```
 
 Ước lượng restore 30 GB ở tốc độ đo được (~2,2 MB/s upload; download thường nhanh hơn

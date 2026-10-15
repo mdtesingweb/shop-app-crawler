@@ -1,12 +1,12 @@
 # Data Architecture — Shop App Crawler
 
-**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.2 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt (vòng cuối)
 **Phạm vi:** Data Acquisition Layer, Shop app only. Chưa viết crawler, chưa tạo database,
 chưa thu thập bulk.
 
-v1.1: TIMESTAMP mọi nơi · tách fetch/review status · priority scheduling (design) ·
-review identity nhiều tầng · `current/` đúng 1 dòng/SP. Chi tiết thay đổi:
-`SCHEMA_EVOLUTION.md` mục 6.
+v1.2: `observation_id` + thứ tự xác định · R14 viết lại · `current/` publication nguyên tử
+qua generation manifest · recovery protocol staging→parquet→sqlite · `explore_budget_pct=15`.
+Chi tiết: `SCHEMA_EVOLUTION.md` mục 6.
 
 Mọi trường "đã kiểm chứng" dưới đây dựa trên dữ liệu Shop app đo thực tế.
 Trường "giả định" được gắn nhãn rõ ràng. Vấn đề chính sách truy cập & pháp lý:
@@ -81,20 +81,23 @@ tài liệu riêng `ACCESS_POLICY_AND_RISKS.md`.
 ## 4. Luồng dữ liệu tổng thể
 
 ```
-sitemap_urls ──► crawl_jobs ──► crawl_targets (queue window, lease/retry)
+sitemap_urls ──► crawl_jobs ──► crawl_targets (queue window, lease/retry, priority)
       │                │
       │                ▼
-      │         fetch tiles ──► observations ──┬──► lake/products (delta)
-      │                                       ├──► lake/product_collections
-      │                                       ├──► lake/product_merchants
-      │                                       ├──► lake/product_images
-      │                                       ├──► field_changes (diff vs current)
-      │                                       └──► product_review_state (upsert SQLite)
+      │         fetch tiles ──► ingest_staging (JSONL, fsync)
+      │                              │
+      │                              ▼
+      │                       lake/ (delta, idempotent) ──► SQLite advance (tx)
+      │                              │                           │
+      │                              ├──► field_changes (diff intraday)  │
+      │                              └──► product_review_state (upsert) ─┘
+      │                                       (fail fetch không đụng data;
+      │                                        giảm thật được ghi nhận)
       ▼
-compaction (per-bucket, atomic replace) ──► current/ ──► DuckDB queries / Sheets export (curated)
-      │
+compaction (per-bucket → generation staging) ──► atomic publish current/
+      │──► DuckDB queries / Sheets export (curated)
       ▼
-backup manifest ──► Google Drive (MD5 verify tại upload, SHA-256 post-restore)
+backup manifest (theo generation) ──► Google Drive
 ```
 
 ## 5. Provenance (bắt buộc mọi dòng dữ liệu)

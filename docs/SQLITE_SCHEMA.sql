@@ -1,17 +1,16 @@
 -- ============================================================================
 -- SQLITE_SCHEMA.sql — Shop App Crawler
--- Version: 1.1 | Date: 2026-10-15 | Status: DRAFT (design only)
+-- Version: 1.2 | Date: 2026-10-15 | Status: DRAFT (design only)
 --
 -- *** DESIGN DOCUMENT ONLY — DO NOT EXECUTE ***
 -- This file is a DDL design blueprint. No database has been created from it.
 -- It must pass review before any migration is run.
 --
--- v1.1 corrections (2026-10-15 design review):
---   1. observed_at/last_seen are TIMESTAMP (UTC), not DATE — intraday precision.
---   2. product_review_state split: fetch_status (access) vs review_status (data).
---      A 403 updates fetch_status only; last known review data is preserved.
---   3. Priority scheduling tables: collection scores, merchant feedback,
---      per-collection crawl stats, crawl_policy, target priority.
+-- v1.2 corrections (2026-10-15 final design review):
+--   1. New table ingest_batches: crash-safe ingest checkpoint (staging → parquet → sqlite).
+--   2. crawl_policy seed defaults: explore_budget_pct=15 (APPROVED, configurable).
+--   3. product_review_state: documented invariant — only successful observations update
+--      review_count/rating_avg/review_status, INCLUDING real decreases.
 --
 -- Conventions:
 --   * Natural keys from shop.app (merchant_key, collection_key, product_id).
@@ -70,6 +69,9 @@ CREATE INDEX IF NOT EXISTS idx_collections_priority
 -- ----------------------------------------------------------------------------
 -- 3. product_review_state — up to 54.5M rows (mutable aggregate)
 --    v1.1: fetch/access status SEPARATED from review data status.
+--    v1.2 (APPROVED): ONLY a successful data observation updates review_count /
+--    rating_avg / review_status — INCLUDING real decreases (a drop from 2700 to
+--    2400 is recorded as-is and logged to field_changes; never clamped).
 --    A failed fetch NEVER overwrites last known review data.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS product_review_state (
@@ -149,9 +151,34 @@ CREATE TABLE IF NOT EXISTS crawl_policy (
 );
 -- Intended keys: explore_budget_pct, score_version, reward_thresholds,
 --                max_targets_per_job, collection_batch_size.
+-- Seed defaults (APPROVED 2026-10-15; configurable, re-tune after benchmark):
+--   INSERT INTO crawl_policy(policy_key, policy_value) VALUES
+--     ('explore_budget_pct', '15'),
+--     ('score_version', 'v0'),
+--     ('reward_thresholds', '[1,10,50,100]'),
+--     ('max_targets_per_job', '1000000');
 
 -- ----------------------------------------------------------------------------
--- 7. crawl_targets — queue WINDOW (~1M rows, NOT 54.5M)
+-- 7. ingest_batches — crash-safe ingest checkpoint (v1.2)
+--    Protocol: staging JSONL (fsync) → Parquet (idempotent by file name) →
+--    SQLite advance (transaction) → mark complete → clean staging.
+--    Recovery replays from staging; Parquet batch files are never rewritten.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ingest_batches (
+    batch_key    TEXT NOT NULL PRIMARY KEY,  -- <job_id>:<batch_seq>, e.g. 1042:000137
+    job_id       INTEGER NOT NULL REFERENCES crawl_jobs(job_id),
+    status       TEXT NOT NULL DEFAULT 'STAGED'
+                  CHECK (status IN ('STAGED','PARQUET_DONE','COMPLETE')),
+    parquet_path TEXT,                        -- lake path once written (deterministic name)
+    rows_count   INTEGER,
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_batches_job
+    ON ingest_batches(job_id, status);
+
+-- ----------------------------------------------------------------------------
+-- 8. crawl_targets — queue WINDOW (~1M rows, NOT 54.5M)
 --    Crash-safe via leases: sweeper requeues expired IN_PROGRESS rows.
 --    URLs are NOT stored here (resolved at dispatch via sitemap_urls join).
 -- ----------------------------------------------------------------------------
@@ -182,7 +209,7 @@ CREATE INDEX IF NOT EXISTS idx_targets_dispatch
 -- low-priority/never-crawled targets (anti-starvation).
 
 -- ----------------------------------------------------------------------------
--- 8. crawl_errors — sampled, append-only
+-- 9. crawl_errors — sampled, append-only
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS crawl_errors (
     error_id    INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +226,7 @@ CREATE INDEX IF NOT EXISTS idx_errors_target ON crawl_errors(target_key);
 CREATE INDEX IF NOT EXISTS idx_errors_class ON crawl_errors(error_class, observed_at);
 
 -- ----------------------------------------------------------------------------
--- 9. dq_violations — sampled
+-- 10. dq_violations — sampled
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dq_violations (
     violation_id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -212,7 +239,7 @@ CREATE TABLE IF NOT EXISTS dq_violations (
 CREATE INDEX IF NOT EXISTS idx_dq_rule ON dq_violations(rule_id, observed_at);
 
 -- ----------------------------------------------------------------------------
--- 10. sheets_export_log — tiny
+-- 11. sheets_export_log — tiny
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sheets_export_log (
     export_id       INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,

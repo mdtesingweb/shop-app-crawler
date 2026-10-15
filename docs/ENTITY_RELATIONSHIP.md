@@ -1,10 +1,10 @@
 # Entity Relationship — Shop App Crawler
 
-**Phiên bản:** 1.1 | **Ngày:** 2026-10-15
+**Phiên bản:** 1.2 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt (vòng cuối)
+
+v1.2: thêm `ingest_batches`; `current/` publication theo generation.
 
 Ký hiệu: `PK` primary key · `FK` foreign key · `UQ` unique · `*` NOT NULL.
-v1.1: tách fetch_status/review_status · thêm collection_crawl_stats, crawl_policy ·
-TIMESTAMP mọi nơi · current/ 1-dòng-1-SP.
 
 ## ERD (SQLite — vận hành)
 
@@ -50,8 +50,8 @@ TIMESTAMP mọi nơi · current/ 1-dòng-1-SP.
 │ products (Parquet)  │◄───────┴─────────────┘
 │ lake/ + current/    │
 │─────────────────────│
-│ PK* product_id      │   current/: ĐÚNG 1 dòng/product_id (writer đảm bảo)
-│    url* / title*    │   lake/: mọi quan sát (TIMESTAMP phân biệt intraday)
+│ PK* product_id      │   current/: 1 dòng/SP/generation, publish nguyên tử
+│    url* / title*    │   lake/: mọi quan sát (observation_id, TIMESTAMP)
 │    price*           │
 │    image_url*       │
 └────────┬────────────┘
@@ -95,6 +95,15 @@ TIMESTAMP mọi nơi · current/ 1-dòng-1-SP.
 │ field_name*         │
 │ old/new_value       │
 │ observed_at* (TS)   │
+└─────────────────────┘
+
+┌─────────────────────┐
+│ ingest_batches      │
+│─────────────────────│
+│ PK* batch_key       │
+│ FK* job_id          │
+│    status*          │  STAGED→PARQUET_DONE→COMPLETE
+│    parquet_path     │
 └─────────────────────┘
 ```
 

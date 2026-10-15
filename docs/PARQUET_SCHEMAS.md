@@ -1,6 +1,9 @@
 # Parquet Schemas — Shop App Crawler
 
-**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.2 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt (vòng cuối)
+
+v1.2: thêm `observation_id` (định danh quan sát ổn định); `current/` publication
+nguyên tử qua generation manifest.
 
 v1.1: mọi `observed_at` là **TIMESTAMP UTC** (microsecond) — phân biệt nhiều quan sát
 cùng ngày. Partition dùng cột DATE suy ra (`crawl_date`, `ym`).
@@ -22,12 +25,13 @@ Mỗi dòng = một quan sát. **Không dedup lúc ingest** (v1.1 #2).
 
 | Cột | Kiểu | Null | Nguồn | Ghi chú |
 |---|---|---|---|---|
+| observation_id | string | no | **[A]** | **Định danh ổn định**: `<job_id>:<batch_seq>:<row_seq>` (vd `1042:000137:000012`). Thứ tự xác định: `ORDER BY observed_at, observation_id` |
 | product_id | int64 | no | **[V]** | Dedup key lúc compact |
 | url / title / price / currency | string,string,double,string | no | **[V]** | Như v1.0 |
 | image_url / image_alt | string | no/yes | **[V]** | |
 | review_count | int64 | yes | **[V]** | Tại thời điểm quan sát; NULL nếu tile không hiện |
 | rating_avg | double | yes | **[V]** | Luôn NULL đến khi product page mở được |
-| observed_at | timestamp | no | **[V]** | **TIMESTAMP** — nhiều quan sát/ngày giữ hết |
+| observed_at | timestamp | no | **[V]** | **Gán lúc fetch**, ingest giữ nguyên → replay an toàn |
 | crawl_date | date32 | no | suy ra | Partition (từ observed_at) |
 | source_surface / collector_version / parser_version | string | no | | |
 
@@ -36,8 +40,10 @@ Base 54,5M × **149 B** (đo) ≈ **8,1 GB**.
 
 ## 3. `lake/product_collections/` — edges n–n
 
-`(product_id, collection_key, position INT32 NULL, observed_at TIMESTAMP,
-crawl_date DATE [partition], source_surface)`. Dedup: `(product_id, collection_key, crawl_date)`.
+`(product_id, collection_key, position INT32 NULL, observation_id TEXT NULL,
+observed_at TIMESTAMP, crawl_date DATE [partition], source_surface)`.
+Dedup: `(product_id, collection_key, crawl_date)`.
+`observation_id` trỏ về quan sát tile đã sinh ra edge (traceability, v1.2).
 ~109M edges ≈ **1,3–1,5 GB**.
 
 ## 4. `lake/product_merchants/` — observations
@@ -83,12 +89,23 @@ observed_at TIMESTAMP, ym STRING [partition], job_id INT64 NULL, source_surface)
 **Quy tắc v1.1:** diff trên chuỗi quan sát liên tiếp `(product_id, observed_at)` —
 mọi thay đổi intraday đều ghi, không gộp ngày. ~**1,6 GB/năm** (giả định).
 
-## 8. `current/bucket-*.parquet` — ĐÚNG 1 DÒNG/product_id (v1.1 #6)
+## 8. `current/` — ĐÚNG 1 DÒNG/product_id + PUBLICATION NGUYÊN TỬ (v1.2)
 
-Schema = §2 + `bucket INT32`. **Không partition ym.** 256 files.
-Writer đảm bảo bất biến 1-dòng-1-SP bằng atomic per-bucket replace;
-`current_manifest.json` ghi `{bucket,file,rows,max_observed_at,compacted_at}`.
-Query không dedup lại (DQ R15). ~**8 GB** ở 54,5M, **tái tạo được** → backup ưu tiên thấp.
+```
+current/
+  generations/
+    gen_0007/bucket-000.parquet … bucket-255.parquet   # chỉ bucket được rewrite
+  manifests/
+    manifest_gen_0007.json    # đủ 256 buckets (bucket không đổi trỏ về gen cũ)
+  current_latest.json         # {"generation": "gen_0007"} — con trỏ nguyên tử
+```
+
+- Schema mỗi bucket = §2 + `bucket INT32`. **Không partition ym.**
+- Mỗi generation là snapshot nhất quán; publication = atomic rename
+  `current_latest.json`. Crash giữa compaction → reader vẫn thấy generation cũ.
+- Query resolve file list từ manifest của generation hiện tại (không glob mù).
+- ~**8 GB** ở 54,5M, **tái tạo được** → backup ưu tiên thấp (nhưng manifest
+  generation phải có trong backup manifest — xem BACKUP_RESTORE_DESIGN).
 
 ## Quy tắc chung
 

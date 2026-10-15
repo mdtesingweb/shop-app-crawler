@@ -1,10 +1,9 @@
 # Data Dictionary — Shop App Crawler
 
-**Phiên bản:** 1.1 | **Ngày:** 2026-10-15
+**Phiên bản:** 1.2 | **Ngày:** 2026-10-15
 
 Nguồn: **[V]** kiểm chứng thực tế · **[A]** giả định · **[D]** tài liệu (chưa data thật).
-v1.1: TIMESTAMP mọi nơi · tách fetch/review status · review identity nhiều tầng ·
-bảng scheduling mới.
+v1.2: `observation_id` · generation manifest · `ingest_batches` · `explore_budget_pct=15`.
 
 **Mọi cột thời gian quan sát là TIMESTAMP UTC** (microsecond khi có). Partition dùng
 cột DATE suy ra (`crawl_date`, `ym`).
@@ -17,7 +16,9 @@ cột DATE suy ra (`crawl_date`, `ym`).
 | `merchant_key` | TEXT | **[V]** | Token `/m/<token>` → PK merchants |
 | `collection_key` | TEXT | **[V]** | `<merchant_key>/<collection_id>` → PK collections |
 | `target_key` | TEXT | **[A]** | `p:<product_id>` / `c:<collection_key>` / `m:<merchant_key>` |
-| `review_id` | TEXT | **[A]** | **Surrogate** `rv_<uuid4hex>`, luôn có — không suy từ nội dung (v1.1) |
+| `review_id` | TEXT | **[A]** | **Surrogate** `rv_<uuid4hex>`, luôn có — không suy từ nội dung |
+| `observation_id` | TEXT | **[A]** | **Định danh quan sát ổn định** `<job_id>:<batch_seq>:<row_seq>` (v1.2). Thứ tự xác định: `ORDER BY observed_at, observation_id` |
+| `generation_id` | TEXT | **[A]** | `gen_<NNN>` — một lần publication `current/` (v1.2) |
 
 ## Products (§2 PARQUET_SCHEMAS)
 
@@ -42,7 +43,7 @@ cột DATE suy ra (`crawl_date`, `ym`).
 | `last_success_at` | yes | **[V]** | Lần data OK gần nhất |
 | `last_attempt_at` | no | **[V]** | Lần thử fetch gần nhất (mọi kết quả) |
 
-## Scheduling (mới v1.1 — design, chưa thuật toán)
+## Scheduling (design)
 
 | Field | Nguồn | Ngữ nghĩa |
 |---|---|---|
@@ -52,7 +53,15 @@ cột DATE suy ra (`crawl_date`, `ym`).
 | `merchants.merchant_score` | **[A]** | Merchant Feedback từ yield collections đã crawl |
 | `collection_crawl_stats.reward_r1/10/50/100` | **[V]** | Vector reward R_T = unique reviewed / requests × 1000 |
 | `crawl_targets.priority` | **[A]** | Scheduler `ORDER BY priority DESC` + `explore_budget_pct` chống starvation |
-| `crawl_policy.*` | **[A]** | Knobs: `explore_budget_pct`, `score_version`, thresholds... |
+| `crawl_policy.explore_budget_pct` | **[A]** | Mặc định **15** (APPROVED), cấu hình được, hiệu chỉnh sau benchmark |
+
+## Ingest & recovery (v1.2)
+
+| Field | Nguồn | Ngữ nghĩa |
+|---|---|---|
+| `ingest_batches.batch_key` | **[A]** | `<job_id>:<batch_seq>` — checkpoint crash-safe |
+| `ingest_batches.status` | **[A]** | `STAGED` → `PARQUET_DONE` → `COMPLETE` |
+| `observed_at` (products) | **[V]** | **Gán lúc fetch**, ingest giữ nguyên → replay an toàn |
 
 ## Review identity (v1.1 — không hash-mặc-định)
 

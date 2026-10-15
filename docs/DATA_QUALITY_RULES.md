@@ -1,9 +1,9 @@
 # Data Quality Rules — Shop App Crawler
 
-**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.2 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt (vòng cuối)
 
-v1.1: R14 viết lại theo tách fetch/review status; thêm R15 (current uniqueness),
-R16 (fetch/data consistency), R17 (review identity).
+v1.2: R14 viết lại — hết mâu thuẫn với `NO_REVIEWS` suy luận; thêm R19 (generation
+consistency), R20 (observation ordering), R21 (ingest batch completeness).
 
 Chạy bằng DuckDB sau mỗi crawl job + định kỳ toàn corpus (theo partition).
 Kết quả vào `dq_violations` (SQLite, sampled) + tổng hợp vào `crawl_jobs.stats_json`.
@@ -25,13 +25,20 @@ Kết quả vào `dq_violations` (SQLite, sampled) + tổng hợp vào `crawl_jo
 | R11 | field_changes | `old_value != new_value` | WARN | Bỏ qua diff rỗng (parser normalize) |
 | R12 | crawl_targets | Không có `IN_PROGRESS` quá hạn lease sau sweeper | ERROR | Sweeper tự phục hồi (mục 2) |
 | R13 | freshness | `max(last_attempt_at)` của `product_review_state` ≤ 48h so với lịch crawl | WARN | Báo động pipeline đứng |
-| R14 | state | `review_count IS NULL` ⟺ `review_status='UNKNOWN'`; `fetch_status != 'OK'` không đổi data columns (so `last_success_at` vs `last_attempt_at`) | ERROR | Vi phạm = ingest bug |
-| R15 | current/ | `COUNT(*) == COUNT(DISTINCT product_id)` trên toàn `current/` | ERROR | Writer bug — dừng compaction, điều tra |
-| R16 | state | Không có `review_status='HAS_REVIEWS'` với `review_count IS NULL`; `NO_REVIEWS` luôn có `confidence < 1.0` | ERROR | Ngộ nhận suy luận thành sự thật |
+| R14 | state | (a) `review_status='HAS_REVIEWS'` ⟹ `review_count IS NOT NULL`; (b) `review_status='UNKNOWN'` ⟹ `review_count IS NULL`; (c) `review_status='NO_REVIEWS'` ⟹ `review_count IS NULL AND confidence < 1.0` (đánh dấu suy luận — **không mâu thuẫn** vì NULL hợp lệ cho cả UNKNOWN và NO_REVIEWS, phân biệt bằng confidence); (d) `review_status IN ('HAS_REVIEWS','NO_REVIEWS')` ⟹ `last_success_at IS NOT NULL`; (e) `fetch_status != 'OK'` ⟹ data columns không đổi so với lần success (so `last_success_at`) | ERROR | Vi phạm = ingest bug |
+| R15 | current/ | `COUNT(*) == COUNT(DISTINCT product_id)` **trong generation đang live** | ERROR | Writer bug — dừng compaction, điều tra |
+| R16 | state | `NO_REVIEWS` luôn có `confidence < 1.0` (không ngộ nhận suy luận thành sự thật) | ERROR | — |
 | R17 | reviews (future) | `identity_method` hợp lệ; `content_fallback`/`surrogate_only` gắn cờ duplicate candidate | WARN | Không mặc định hash = ID |
 | R18 | missing-field | Tỷ lệ NULL `title`/`price`/`image_url` = 0% | ERROR | Không field bắt buộc nào NULL âm thầm |
+| R19 | current/ | Generation manifest: đủ 256 buckets, mọi file tồn tại, `current_latest.json` trỏ generation có manifest | ERROR | Publication dở dang — không cho query |
+| R20 | lake/ | Không trùng `(product_id, observed_at, observation_id)`; thứ tự `(observed_at, observation_id)` là total order | ERROR | Ingest bug |
+| R21 | ingest | Không có dòng `ingest_batches` ở `STAGED`/`PARQUET_DONE` quá 24h chưa `COMPLETE` (trừ job đang chạy) | WARN | Crash chưa phục hồi — chạy recovery |
 
 ## 2. Checks vận hành
+
+**Lưu ý (APPROVED):** review count **giảm thật không phải violation** — R14 chỉ kiểm tra
+tính nhất quán trạng thái, không áp đặt đơn điệu tăng. Giảm được ghi nhận nguyên vẹn
+và log vào `field_changes`.
 
 - **Orphan detection:** query R2/R6/R7 mỗi lần ingest batch — orphan được **giữ lại**
   (không xóa), vì ingest có thể đến không theo thứ tự (edge về trước product).
