@@ -1,6 +1,9 @@
 # Backup & Restore Design — Shop App Crawler
 
-**Phiên bản:** 1.0 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+
+v1.1: backup manifest bao gồm `current_manifest.json` (để restore kiểm tra
+tính đầy đủ của `current/`).
 
 Tương thích `docs/storage-architecture.md` mục 4–9 (đã APPROVED):
 MD5-vs-md5Checksum tại upload · SHA-256 post-restore · manifest = snapshot nhất quán ·
@@ -38,6 +41,8 @@ manifest chưa chốt = snapshot chưa tồn tại → chạy lại từ đầu,
   "schema_version": "1.0",
   "sqlite": {"path": "state/crawl_state-20261015.db",
              "md5": "...", "sha256": "...", "bytes": 12345},
+  "current_manifest": {"path": "current/current_manifest.json",
+             "md5": "...", "sha256": "..."},
   "parquet": [
     {"path": "lake/products/crawl_date=2026-10-15/part-0000.parquet",
      "md5": "...", "sha256": "...", "bytes": 134217728, "rows": 812340}

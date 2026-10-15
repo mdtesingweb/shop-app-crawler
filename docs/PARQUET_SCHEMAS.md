@@ -1,141 +1,97 @@
 # Parquet Schemas — Shop App Crawler
 
-**Phiên bản:** 1.0 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
 
-Mọi dataset: Snappy hoặc ZSTD (mặc định **ZSTD level 3** — đo được 3,7x trên dữ liệu
-thật high-cardinality). File **bất biến**. `schema_version` ghi trong metadata mỗi file
-(xem `SCHEMA_EVOLUTION.md`). Kiểu Arrow ghi trong ngoặc.
+v1.1: mọi `observed_at` là **TIMESTAMP UTC** (microsecond) — phân biệt nhiều quan sát
+cùng ngày. Partition dùng cột DATE suy ra (`crawl_date`, `ym`).
 
-Quy ước NULL: mọi cột quan sát được đều nullable trừ khóa và cột provenance bắt buộc.
+Mặc định **ZSTD level 3** (đo 3,7x trên dữ liệu thật high-cardinality). File **bất biến**.
+`schema_version` trong metadata mỗi file. Không field nào được coi "đã kiểm chứng"
+trừ khi gắn **[V]**.
 
 ---
 
-## 1. `lake/sitemap_urls/` — vũ trụ discovery (ghi 1 lần)
+## 1. `lake/sitemap_urls/` — vũ trụ discovery
 
-Partition: `url_type` (hive: `url_type=product/`).
+Partition: `url_type`. `(url **[V]** PK logic, url_type, shard INT32, discovered_at TIMESTAMP)`
+~56,5M URLs → **~0,6 GB** (giả định nén 10x).
 
-| Cột | Kiểu | Null | Ghi chú |
-|---|---|---|---|
-| url | string | no | PK logic. `https://shop.app/products/<id>/<slug>` |
-| url_type | string | no | `product` \| `merchant` \| `collection` (partition) |
-| shard | int32 | no | Shard sitemap gốc (0..1089 products) |
-| discovered_at | date32 | no | Ngày ingest sitemap |
+## 2. `lake/products/` — snapshots: GIỮ MỌI QUAN SÁT
 
-Khối lượng (đo/giả định): 56,5M URLs × ~85 B raw → **~0,6 GB** ZSTD (giả định nén 10x
-nhờ tiền tố URL lặp — gắn nhãn giả định).
+Mỗi dòng = một quan sát. **Không dedup lúc ingest** (v1.1 #2).
 
-## 2. `lake/products/` — snapshots delta (base + deltas)
+| Cột | Kiểu | Null | Nguồn | Ghi chú |
+|---|---|---|---|---|
+| product_id | int64 | no | **[V]** | Dedup key lúc compact |
+| url / title / price / currency | string,string,double,string | no | **[V]** | Như v1.0 |
+| image_url / image_alt | string | no/yes | **[V]** | |
+| review_count | int64 | yes | **[V]** | Tại thời điểm quan sát; NULL nếu tile không hiện |
+| rating_avg | double | yes | **[V]** | Luôn NULL đến khi product page mở được |
+| observed_at | timestamp | no | **[V]** | **TIMESTAMP** — nhiều quan sát/ngày giữ hết |
+| crawl_date | date32 | no | suy ra | Partition (từ observed_at) |
+| source_surface / collector_version / parser_version | string | no | | |
 
-Mỗi dòng = **một quan sát** 1 SP tại 1 thời điểm. Partition: `crawl_date`.
-
-| Cột | Kiểu | Null | Ghi chú |
-|---|---|---|---|
-| product_id | int64 | no | ID số từ URL — dedup key |
-| url | string | no | URL đầy đủ tại thời điểm quan sát |
-| title | string | no | Từ tile (vd "how to live t-shirt") |
-| price | double | no | Đã parse `$31.50` → 31.5 |
-| currency | string | no | `USD` (quan sát thực tế) |
-| image_url | string | no | Ảnh chính của tile (`cdn.shopify.com`, đã strip param resize ngoài `width`) |
-| image_alt | string | yes | Alt-text (20–200 ký tự thực tế) |
-| review_count | int64 | yes | Count trên tile tại T; NULL nếu tile không hiện |
-| rating_avg | double | yes | **Luôn NULL** đến khi product page mở được (tiles không hiện sao) |
-| observed_at | date32 | no | |
-| source_surface | string | no | `collection_tile` \| `merchant_tile` \| `search_tile` |
-| collector_version | string | no | |
-| parser_version | string | no | |
-
-Dedup logic lúc compact: `(product_id, crawl_date)` giữ `observed_at` lớn nhất.
-Khối lượng: 54,5M × **149 B** (đo) ≈ **8,1 GB** cho base snapshot.
+Dedup chỉ ở compaction: `(product_id)` + `ORDER BY observed_at DESC`.
+Base 54,5M × **149 B** (đo) ≈ **8,1 GB**.
 
 ## 3. `lake/product_collections/` — edges n–n
 
+`(product_id, collection_key, position INT32 NULL, observed_at TIMESTAMP,
+crawl_date DATE [partition], source_surface)`. Dedup: `(product_id, collection_key, crawl_date)`.
+~109M edges ≈ **1,3–1,5 GB**.
+
+## 4. `lake/product_merchants/` — observations
+
+`(product_id, merchant_key, first_observed_at TIMESTAMP, last_observed_at TIMESTAMP,
+evidence)`. ~54,5M × 30 B ≈ **1,6 GB** (giả định).
+
+## 5. `lake/product_images/` — URL only
+
+`(product_id, image_url, image_alt NULL, position INT32, observed_at TIMESTAMP,
+crawl_date DATE [partition], source_surface)`. PK logic `(product_id, image_url)`.
+~1 ảnh/SP → **2,7 GB** (giả định).
+
+## 6. `lake/reviews/` — identity nhiều tầng (v1.1 #5)
+
+Schema sẵn, **chưa data**. Không mặc định hash = ID ổn định.
+
 | Cột | Kiểu | Null | Ghi chú |
 |---|---|---|---|
+| review_id | string | no | **PK surrogate** `rv_<uuid4hex>` — luôn có, không suy từ nội dung |
+| review_key_platform | string | yes | ID platform nếu từng thấy |
 | product_id | int64 | no | |
-| collection_key | string | no | `<merchant_key>/<collection_id>` |
-| position | int32 | yes | Vị trí tile trong collection (nếu ghi nhận được) |
-| observed_at | date32 | no | |
+| author / author_norm | string | yes | `author_norm`: lowercase+strip, phục vụ match |
+| created_at | timestamp | yes | NULL khi thiếu |
+| content_sha256 | string | yes | Tín hiệu, không phải ID |
+| identity_method | string | no | `platform_id`→`author_time`→`content_fallback`→`surrogate_only` |
+| identity_confidence | float | no | 1.0 → 0.3 theo method |
+| version | int32 | no | Tăng khi nội dung bị **sửa** (cùng identity, khác hash) |
+| supersedes | string | yes | `review_id` version trước |
+| rating/title/body | int8/string/string | yes | Chưa kiểm chứng field thật |
+| verified_purchase/helpful_count/merchant_reply | boolean/int64/string | yes | Từ tài liệu Shop (chưa data) |
+| observed_at | timestamp | no | |
+| crawl_date | date32 | no | Partition |
 | source_surface | string | no | |
 
-Partition: `crawl_date`. Dedup: `(product_id, collection_key, crawl_date)`.
-Khối lượng: ~109M edges (giả định ~2/SP) × ~12 B ≈ **1,3–1,5 GB**.
+View current: `MAX(version)` mỗi identity. Kịch bản dung lượng: 5%×15 ≈ 3 GB;
+20%×30 ≈ 25 GB.
 
-## 4. `lake/product_merchants/` — observations P–M
+## 7. `lake/field_changes/` — append-only, diff theo chuỗi TIMESTAMP
 
-| Cột | Kiểu | Null | Ghi chú |
-|---|---|---|---|
-| product_id | int64 | no | |
-| merchant_key | string | no | |
-| first_observed_at | date32 | no | |
-| last_observed_at | date32 | no | |
-| evidence | string | no | `collection_tile` \| `merchant_tile` \| `search_tile` |
+`(entity_type, entity_key, field_name, old_value STRING NULL, new_value STRING NULL,
+observed_at TIMESTAMP, ym STRING [partition], job_id INT64 NULL, source_surface)`.
+**Quy tắc v1.1:** diff trên chuỗi quan sát liên tiếp `(product_id, observed_at)` —
+mọi thay đổi intraday đều ghi, không gộp ngày. ~**1,6 GB/năm** (giả định).
 
-Không partition theo ngày (bảng observations gộp dần, rewrite theo merchant batch
-nhỏ khi cần — hoặc append và dedup lúc đọc; xem PARTITION_AND_COMPACTION).
-Khối lượng: 54,5M × ~30 B ≈ **1,6 GB** (giả định).
+## 8. `current/bucket-*.parquet` — ĐÚNG 1 DÒNG/product_id (v1.1 #6)
 
-## 5. `lake/product_images/` — URL ảnh, KHÔNG binary
-
-| Cột | Kiểu | Null | Ghi chú |
-|---|---|---|---|
-| product_id | int64 | no | |
-| image_url | string | no | PK logic cùng product_id |
-| image_alt | string | yes | |
-| position | int32 | no | 0 = ảnh chính |
-| observed_at | date32 | no | |
-| source_surface | string | no | |
-
-Partition: `crawl_date`. Khối lượng: ~1 ảnh/SP giai đoạn tiles → 54,5M × ~50 B ≈
-**2,7 GB** (giả định; tăng khi product page mở được nhiều ảnh).
-
-## 6. `lake/reviews/` — SCHEMA SẴN, CHƯA CÓ DATA
-
-Mở khi Tier 3 (review text) có đường truy cập hợp lệ. Mọi cột nội dung nullable
-vì field thực tế **chưa kiểm chứng** — không tưởng tượng API fields.
-
-| Cột | Kiểu | Null | Ghi chú |
-|---|---|---|---|
-| review_id | string | no | PK: `sha1(product_id\|author\|created_at\|body[0:64])` — dedup crawl lại |
-| product_id | int64 | no | |
-| rating | int8 | yes | 1–5 (kỳ vọng; chưa kiểm chứng) |
-| title | string | yes | |
-| body | string | yes | Giới hạn Shop ≤1000 ký tự (từ help.shopify.com — tài liệu, chưa thấy data thật) |
-| author | string | yes | Ẩn danh hóa nếu cần |
-| created_at | timestamp | yes | |
-| verified_purchase | boolean | yes | Shop reviews là verified-purchase-only (tài liệu) |
-| helpful_count | int64 | yes | |
-| merchant_reply | string | yes | |
-| observed_at | date32 | no | |
-| source_surface | string | no | |
-
-Partition: `crawl_date`. Khối lượng: **kịch bản** — 5% SP × 15 reviews ≈ 3 GB;
-20% × 30 reviews ≈ 25 GB (xem DATA_ARCHITECTURE rủi ro #5).
-
-## 7. `lake/field_changes/` — history field-level, append-only
-
-| Cột | Kiểu | Null | Ghi chú |
-|---|---|---|---|
-| entity_type | string | no | `product` \| `collection` \| `merchant` |
-| entity_key | string | no | product_id / collection_key / merchant_key (stringified) |
-| field_name | string | no | `price` \| `title` \| `review_count` \| ... |
-| old_value | string | yes | Stringified (trade-off: schema ổn định) |
-| new_value | string | yes | |
-| observed_at | date32 | no | |
-| job_id | int64 | yes | |
-| source_surface | string | no | |
-
-Partition: `ym` (tháng). Khối lượng: giả định 3% SP crawl/ngày đổi × 1M crawl/ngày
-→ ~30k diffs/ngày × ~150 B ≈ **1,6 GB/năm**.
-
-## 8. `current/ym=*/bucket-*.parquet` — serving copy (tái tạo được)
-
-Schema = `lake/products/` + `bucket int32`. Partition hive: `ym` × `bucket`
-(256 buckets, `bucket = hash(product_id) % 256`).
-Khối lượng: ≈ base **8 GB** ở 54,5M. **Tái tạo được từ `lake/`** → backup ưu tiên thấp.
-Xem `PARTITION_AND_COMPACTION.md`.
+Schema = §2 + `bucket INT32`. **Không partition ym.** 256 files.
+Writer đảm bảo bất biến 1-dòng-1-SP bằng atomic per-bucket replace;
+`current_manifest.json` ghi `{bucket,file,rows,max_observed_at,compacted_at}`.
+Query không dedup lại (DQ R15). ~**8 GB** ở 54,5M, **tái tạo được** → backup ưu tiên thấp.
 
 ## Quy tắc chung
 
-- Không FK vật lý trong Parquet — toàn vẹn tham chiếu do DQ job kiểm tra.
-- Không lồng mảng quan hệ trong bảng products — quan hệ nằm ở bảng edges.
-- Mọi thay đổi schema: additive-only, xem `SCHEMA_EVOLUTION.md`.
+- Không FK vật lý trong Parquet — DQ job kiểm tra orphan.
+- Không mảng quan hệ trong products — edges ở bảng riêng.
+- Schema additive-only (SCHEMA_EVOLUTION.md). Đổi hàm hash bucket = migration.

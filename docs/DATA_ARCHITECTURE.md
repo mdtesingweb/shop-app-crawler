@@ -1,11 +1,16 @@
 # Data Architecture — Shop App Crawler
 
-**Phiên bản:** 1.0 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
 **Phạm vi:** Data Acquisition Layer, Shop app only. Chưa viết crawler, chưa tạo database,
-chưa thu thập bulk (chờ phép `bots@shopify.com` hoặc tư vấn pháp lý).
+chưa thu thập bulk.
 
-Mọi trường "đã kiểm chứng" dưới đây dựa trên dữ liệu Shop app đo thực tế
-(collection/merchant/search tiles, sitemaps). Trường "giả định" được gắn nhãn rõ ràng.
+v1.1: TIMESTAMP mọi nơi · tách fetch/review status · priority scheduling (design) ·
+review identity nhiều tầng · `current/` đúng 1 dòng/SP. Chi tiết thay đổi:
+`SCHEMA_EVOLUTION.md` mục 6.
+
+Mọi trường "đã kiểm chứng" dưới đây dựa trên dữ liệu Shop app đo thực tế.
+Trường "giả định" được gắn nhãn rõ ràng. Vấn đề chính sách truy cập & pháp lý:
+tài liệu riêng `ACCESS_POLICY_AND_RISKS.md`.
 
 ---
 
@@ -67,8 +72,8 @@ Mọi trường "đã kiểm chứng" dưới đây dựa trên dữ liệu Shop
 
 | Sự thật | Source of truth | Bản sao phục vụ | Ghi chú |
 |---|---|---|---|
-| Trạng thái SP mới nhất | `lake/` deltas (replay) | `current/` (vật lý hóa) | `current/` tái tạo được → backup ưu tiên thấp |
-| Aggregate review hiện tại | `product_review_state` (SQLite) | — | UPDATE tại chỗ, không lưu thêm ở Parquet |
+| Trạng thái SP mới nhất | `lake/` deltas (replay) | `current/` (vật lý hóa, **đúng 1 dòng/SP**) | `current/` tái tạo được → backup ưu tiên thấp |
+| Aggregate review hiện tại | `product_review_state` (SQLite) | — | UPDATE tại chỗ; **fetch fail không đụng data columns** (v1.1) |
 | Quan hệ P–C–M | `product_collections`, `product_merchants` (Parquet) | — | Không mảng lồng trong bảng products |
 | Nội dung tile tại thời điểm T | `lake/products` snapshot rows | — | `review_count` trong snapshot = quan sát tại T; aggregate mới nhất ở SQLite |
 | URL discovery | `sitemap_urls` (Parquet) | — | `crawl_targets` KHÔNG lưu URL, resolve lúc dispatch (tiết kiệm ~4 GB) |
@@ -86,7 +91,7 @@ sitemap_urls ──► crawl_jobs ──► crawl_targets (queue window, lease/r
       │                                       ├──► field_changes (diff vs current)
       │                                       └──► product_review_state (upsert SQLite)
       ▼
-compaction (theo tháng/bucket) ──► current/ ──► DuckDB queries / Sheets export (curated)
+compaction (per-bucket, atomic replace) ──► current/ ──► DuckDB queries / Sheets export (curated)
       │
       ▼
 backup manifest ──► Google Drive (MD5 verify tại upload, SHA-256 post-restore)
@@ -101,7 +106,7 @@ provenance cho từng field — quá đắt ở 54,5M dòng — ta lưu provenan
 | Cột | Kiểu | Ý nghĩa |
 |---|---|---|
 | `source_surface` | TEXT | `sitemap` \| `collection_tile` \| `merchant_tile` \| `search_tile` \| `product_page` |
-| `observed_at` | DATE | Ngày quan sát (UTC) |
+| `observed_at` | TIMESTAMP | UTC, microsecond khi có — **phân biệt nhiều quan sát cùng ngày** (v1.1) |
 | `collector_version` | TEXT | Phiên bản crawler (vd `crawler-0.3.0`) |
 | `parser_version` | TEXT | Phiên bản parser tile (vd `tile-parser-0.2.1`) |
 

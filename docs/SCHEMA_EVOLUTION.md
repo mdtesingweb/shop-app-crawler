@@ -40,7 +40,7 @@
 lake/products (base + mọi delta, bất biến)
    │ replay theo (product_id, observed_at)
    ▼
-dedup từng bucket (hash % 256) ──► current/ym=*/bucket-*.parquet
+dedup từng bucket (hash % 256) ──► current/bucket-*.parquet
 ```
 
 Rebuild là thao tác **đọc + ghi mới**, không sửa dữ liệu gốc → an toàn chạy lại.
@@ -51,3 +51,10 @@ Dùng khi: đổi logic dedup, nghi corruption ở `current/`, hoặc sau restor
 Interface contracts (DATA_ARCHITECTURE mục 6) là **versioned views**, không phải bảng:
 `v_niche_input_v1`, `v_review_input_v1`, ... Engine đọc qua view versioned →
 đổi schema nội bộ không vỡ engine, chỉ bump view version.
+
+## 6. Lịch sử thay đổi schema
+
+| Phiên bản | Ngày | Thay đổi |
+|---|---|---|
+| 1.0 | 2026-10-15 | Bản đầu. |
+| 1.1 | 2026-10-15 | Design review: (1) `observed_at` DATE→TIMESTAMP UTC mọi nơi; (2) tách `fetch_status`/`review_status`; (3) thêm `collection_crawl_stats`, `crawl_policy`, `priority`/`priority_score`/`merchant_score`; (4) review identity nhiều tầng + versioning; (5) `current/` bỏ partition ym → đúng 1 dòng/product_id (atomic per-bucket replace). Không breaking change với dữ liệu vì chưa có dữ liệu production. |

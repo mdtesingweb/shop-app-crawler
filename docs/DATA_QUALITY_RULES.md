@@ -1,6 +1,9 @@
 # Data Quality Rules — Shop App Crawler
 
-**Phiên bản:** 1.0 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+**Phiên bản:** 1.1 | **Ngày:** 2026-10-15 | **Trạng thái:** DRAFT chờ duyệt
+
+v1.1: R14 viết lại theo tách fetch/review status; thêm R15 (current uniqueness),
+R16 (fetch/data consistency), R17 (review identity).
 
 Chạy bằng DuckDB sau mỗi crawl job + định kỳ toàn corpus (theo partition).
 Kết quả vào `dq_violations` (SQLite, sampled) + tổng hợp vào `crawl_jobs.stats_json`.
@@ -9,7 +12,7 @@ Kết quả vào `dq_violations` (SQLite, sampled) + tổng hợp vào `crawl_jo
 
 | ID | Phạm vi | Rule | Mức | Hành động khi fail |
 |---|---|---|---|---|
-| R1 | products | `product_id` unique trong 1 snapshot ngày | ERROR | Giữ `observed_at` lớn nhất, log conflict |
+| R1 | products | `(product_id, observed_at)` unique trong `lake/` (TIMESTAMP cho phép nhiều quan sát/ngày) | ERROR | Trùng timestamp = ingest bug, giữ 1, log |
 | R2 | product_collections | Mọi `product_id` tồn tại trong products (orphan check) | ERROR | Ghi `dq_violations`, giữ edge (có thể SP chưa ingest) |
 | R3 | products/state | `review_count IS NULL OR review_count >= 0` | ERROR | Quarantine dòng |
 | R4 | products | `price > 0 AND price < 100000` | ERROR | Quarantine (giá tile thực tế $9.99–$98) |
@@ -21,8 +24,12 @@ Kết quả vào `dq_violations` (SQLite, sampled) + tổng hợp vào `crawl_jo
 | R10 | reviews (future) | `review_id` unique; `rating BETWEEN 1 AND 5` | ERROR | Dedup / quarantine |
 | R11 | field_changes | `old_value != new_value` | WARN | Bỏ qua diff rỗng (parser normalize) |
 | R12 | crawl_targets | Không có `IN_PROGRESS` quá hạn lease sau sweeper | ERROR | Sweeper tự phục hồi (mục 2) |
-| R13 | freshness | `max(observed_at)` của `product_review_state` ≤ 48h so với lịch crawl | WARN | Báo động pipeline đứng |
-| R14 | missing-field | Tỷ lệ NULL `title`/`price`/`image_url` = 0%; NULL `review_count` có `review_status` hợp lệ 100% | ERROR | Không có field bắt buộc nào được NULL âm thầm |
+| R13 | freshness | `max(last_attempt_at)` của `product_review_state` ≤ 48h so với lịch crawl | WARN | Báo động pipeline đứng |
+| R14 | state | `review_count IS NULL` ⟺ `review_status='UNKNOWN'`; `fetch_status != 'OK'` không đổi data columns (so `last_success_at` vs `last_attempt_at`) | ERROR | Vi phạm = ingest bug |
+| R15 | current/ | `COUNT(*) == COUNT(DISTINCT product_id)` trên toàn `current/` | ERROR | Writer bug — dừng compaction, điều tra |
+| R16 | state | Không có `review_status='HAS_REVIEWS'` với `review_count IS NULL`; `NO_REVIEWS` luôn có `confidence < 1.0` | ERROR | Ngộ nhận suy luận thành sự thật |
+| R17 | reviews (future) | `identity_method` hợp lệ; `content_fallback`/`surrogate_only` gắn cờ duplicate candidate | WARN | Không mặc định hash = ID |
+| R18 | missing-field | Tỷ lệ NULL `title`/`price`/`image_url` = 0% | ERROR | Không field bắt buộc nào NULL âm thầm |
 
 ## 2. Checks vận hành
 

@@ -1,8 +1,10 @@
 # Entity Relationship — Shop App Crawler
 
-**Phiên bản:** 1.0 | **Ngày:** 2026-10-15
+**Phiên bản:** 1.1 | **Ngày:** 2026-10-15
 
 Ký hiệu: `PK` primary key · `FK` foreign key · `UQ` unique · `*` NOT NULL.
+v1.1: tách fetch_status/review_status · thêm collection_crawl_stats, crawl_policy ·
+TIMESTAMP mọi nơi · current/ 1-dòng-1-SP.
 
 ## ERD (SQLite — vận hành)
 
@@ -13,44 +15,59 @@ Ký hiệu: `PK` primary key · `FK` foreign key · `UQ` unique · `*` NOT NULL.
 │ PK* merchant_key    │──┐   ┌──│ PK* collection_key   │
 │    slug*            │  │   │  │ FK* merchant_key     │
 │    display_name     │  │   │  │    collection_id*    │
-│    shop_url*        │  │   │  │    slug*             │
-│    myshopify_domain │UQ│   │  │    title             │
-│    apparel_prior*   │  │   │  │    intent_tier       │
-│    first_seen*      │  │   │  │    product_count_est │
-│    last_seen*       │  │   │  │    first_seen*       │
-└─────────────────────┘  │   │  │    last_seen*        │
-                         │   │  └──────────────────────┘
-                         │   │
-┌─────────────────────┐  │   │  ┌──────────────────────┐
-│ product_merchants   │  │   │  │ product_collections  │
-│ (Parquet, obs.)     │  │   │  │ (Parquet, n–n)       │
-│─────────────────────│  │   │  │──────────────────────│
-│    product_id*      │──┼───┼──│    product_id*       │
-│ FK* merchant_key    │──┘   └──│ FK* collection_key   │
-│    first_observed*  │         │    position          │
-│    last_observed*   │         │    observed_at*      │
-│    evidence*        │         └──────────────────────┘
-└─────────────────────┘                   │
-                                          │
-┌─────────────────────┐                   │
-│ products (Parquet)  │◄──────────────────┘
+│    shop_url*        │  │   │  │    slug* / title     │
+│    myshopify_domain │UQ│   │  │    intent_tier       │
+│    apparel_prior*   │  │   │  │    priority_score*   │◄── Collection Priority Score
+│    merchant_score*  │◄─┼───┼──│    score_version     │    (design; công thức tương lai)
+│    score_updated_at │  │ F │  │    crawl_count*      │
+│    first_seen*      │  │ e │  │    last_crawled_at   │
+│    last_seen*       │  │ e │  └──────────┬───────────┘
+└─────────────────────┘  │ d │             │ 1
+                         │ b │             │ n
+                         │ a │  ┌──────────▼───────────┐
+                         │ c │  │ collection_crawl_stats│
+                         │ k │  │──────────────────────│
+┌─────────────────────┐  │   │  │ PK* stat_id          │
+│ product_merchants   │  │   │  │ FK* collection_key   │
+│ (Parquet, obs.)     │  │   │  │ FK* job_id           │
+│─────────────────────│  │   │  │    tiles/products/   │
+│    product_id*      │──┼───┼──│    new/unique_reviewed│
+│ FK* merchant_key    │──┘   │  │    requests_used*    │
+│    first_observed*  │      │  │    reward_r1/10/50/100│◄── R_T vector
+│    last_observed*   │      │  └──────────────────────┘
+│    evidence*        │      │
+└─────────────────────┘      │  ┌──────────────────────┐
+                             │  │ product_collections  │
+                             │  │ (Parquet, n–n)       │
+                             │  │──────────────────────│
+                             │  │    product_id*       │
+                             │  │ FK* collection_key   │
+                             │  │    position          │
+                             │  │    observed_at* (TS) │
+                             │  └──────────────────────┘
+                             │             │
+┌─────────────────────┐        │             │
+│ products (Parquet)  │◄───────┴─────────────┘
+│ lake/ + current/    │
 │─────────────────────│
-│ PK* product_id      │
-│    url*             │
-│    title*           │
+│ PK* product_id      │   current/: ĐÚNG 1 dòng/product_id (writer đảm bảo)
+│    url* / title*    │   lake/: mọi quan sát (TIMESTAMP phân biệt intraday)
 │    price*           │
 │    image_url*       │
-│    review_count     │
 └────────┬────────────┘
          │ 1
-         ├───1 product_review_state (SQLite, mutable aggregate)
-         │   │ PK* product_id │ review_count │ rating_avg │ review_status* │ confidence* │
+         ├───1 product_review_state (SQLite) — v1.1 TÁCH 2 trạng thái
+         │   │ PK* product_id
+         │   │ DATA:  review_count │ rating_avg │ review_status* │ confidence*
+         │   │ ACCESS: fetch_status* │ last_success_at │ last_attempt_at*
+         │   │ (fetch fail KHÔNG đụng data columns)
          │
-         ├───n product_images (Parquet) — URL only, no binaries
-         │   │ (product_id*, image_url*)UQ │ image_alt │ position* │
+         ├───n product_images (Parquet) — URL only
+         │   │ (product_id*, image_url*)UQ
          │
-         └───n reviews (Parquet, FUTURE — schema sẵn, chưa data)
-             │ review_id*PK │ rating │ body │ author │ verified_purchase │
+         └───n reviews (Parquet, FUTURE) — identity nhiều tầng
+             │ PK* review_id (surrogate) │ review_key_platform
+             │ identity_method* │ identity_confidence* │ version* │ supersedes
 
 ┌─────────────────────┐         ┌──────────────────────┐
 │ crawl_jobs          │         │ crawl_targets        │
@@ -58,69 +75,53 @@ Ký hiệu: `PK` primary key · `FK` foreign key · `UQ` unique · `*` NOT NULL.
 │ PK* job_id          │──┐   ┌──│ PK* target_key       │
 │    kind*            │  │   │  │    target_type*      │
 │    target_desc*     │  │   │  │    status* (indexed) │
-│    status*          │  │   │  │    attempts*         │
-│    stats_json       │  │   │  │    next_retry_at*    │
-└─────────────────────┘  │   │  │    lease_until       │
-                         │   │  └──────────────────────┘
-                         │   │
-                         │   │  ┌──────────────────────┐
-                         └──┼──│ crawl_errors         │
-                            │  │ PK* error_id │ target_key* │ http_status │
-                            │  └──────────────────────┘
-                            │
-┌─────────────────────┐      │  ┌──────────────────────┐
-│ field_changes       │      │  │ dq_violations        │
-│ (Parquet, history)  │      │  │ PK* violation_id │ rule_id* │
-│ entity_type*        │      │  └──────────────────────┘
-│ entity_key*         │
-│ field_name*         │◄─────┘  (ghi nhận thay đổi, không FK cứng —
-│ old_value           │   Parquet không enforce FK; DQ kiểm tra)
-│ new_value           │
+│    status*          │  │   │  │    priority*         │◄── scheduler ORDER BY
+│    stats_json       │  │   │  │    attempts*         │
+└─────────────────────┘  │   │  │    next_retry_at*    │
+                         │   │  │    lease_until       │
+┌─────────────────────┐  │   │  └──────────────────────┘
+│ crawl_policy        │  │   │
+│─────────────────────│  │   │  ┌──────────────────────┐
+│ PK* policy_key      │  │   │  │ crawl_errors         │
+│    policy_value*    │  │   └──│ PK* error_id │ target_key* │
+│    updated_at*      │  │      └──────────────────────┘
+└─────────────────────┘  │
+                         │      ┌──────────────────────┐
+┌─────────────────────┐  │      │ dq_violations        │
+│ field_changes       │  │      │ PK* violation_id │ rule_id* │
+│ (Parquet, history)  │  │      └──────────────────────┘
+│ entity_type*        │  │
+│ entity_key*         │◄─┘  (không FK cứng — DQ kiểm tra)
+│ field_name*         │
+│ old/new_value       │
+│ observed_at* (TS)   │
 └─────────────────────┘
 ```
 
-## Quan hệ nhiều–nhiều Product–Collection–Merchant
-
-Đây là quan hệ trung tâm của hệ thống, đã kiểm chứng thực tế:
-
-- **Một sản phẩm trong nhiều collections:** đã quan sát (vd SP thuộc cả
-  `graphic-tees` lẫn `new-arrivals`). → `product_collections` giữ **toàn bộ**,
-  không lọc lúc crawl.
-- **Collections thuộc merchant:** join trực tiếp qua `/m/<store>` trong URL
-  collection (đã kiểm chứng) → FK `collections.merchant_key`.
-- **Products → merchants:** sitemap products **không** chứa merchant key
-  (đã kiểm chứng) → quan hệ này là **observation** (`product_merchants`,
-  có `evidence` + `first/last_observed_at`), không phải FK cứng.
-  Một SP có thể có nhiều observations (hiếm); view current chọn mới nhất.
+## Review lifecycle (v1.1 — 2 trục độc lập)
 
 ```
-Ví dụ cụ thể (đã kiểm chứng):
-  merchant 'dogecore'
-    └── collection 'dogecore/166998114364' (graphic-tees)
-          ├── product 10269120594195 ("how to live t-shirt", (14), $31.50)
-          ├── product 10209753989395 ("please consult the horses", (18), $30.00)
-          └── ... (62 products, infinite scroll)
+DATA (review_status):   UNKNOWN ──tile OK, có count──► HAS_REVIEWS
+                            └──tile OK, không count──► NO_REVIEWS (suy luận, conf 0.9)
+
+ACCESS (fetch_status):  NOT_YET_FETCHED ──thử──► OK / HTTP_403 / HTTP_404 / TIMEOUT / CHALLENGE / ERROR
 ```
 
-## Review lifecycle (trạng thái)
+403 hôm nay, OK ngày mai → `fetch_status` đổi, `review_count` giữ nguyên giá trị
+lần success gần nhất. Không còn chuyện "403 làm mất trạng thái review".
 
-```
-NOT_YET_FETCHED ──quan sát tile──► HAS_REVIEWS (có count) / NO_REVIEWS (không count, conf 0.9)
-       │                                    │
-       │──403/challenge─────────────────────► INACCESSIBLE ──retry──► lại vòng quan sát
-       │──404───────────────────────────────► MISSING (terminal)
-```
+## Quan hệ P–C–M (không đổi)
 
-`rating_avg` luôn NULL cho đến khi product page mở được (tiles không hiện sao —
-đã kiểm chứng). Schema `reviews` chi tiết đã sẵn cho Tier 3.
+- 1 SP trong nhiều collections → giữ toàn bộ edges (đã kiểm chứng).
+- Collections → merchants qua `/m/<store>` (FK cứng).
+- Products → merchants là observation (sitemap products không có merchant key).
 
 ## Ràng buộc toàn vẹn
 
-| Ràng buộc | Thực thi ở | Ghi chú |
+| Ràng buộc | Thực thi | Ghi chú |
 |---|---|---|
-| PK/FK/UNIQUE trong SQLite | SQLite (DDL) | Enforce thật |
-| FK logic trong Parquet | **Không enforce** — kiểm tra bằng DQ job (orphan detection) | Parquet không có constraint; trade-off có chủ ý |
-| `review_count >= 0` | DQ rule R3 | Tiles đã chuẩn hóa `2.7K`→2700 lúc parse |
-| `price > 0` | DQ rule R4 | |
-| URL đúng format `shop.app/products/<id>/` | DQ rule R5 | |
-| Không trùng `(product_id, image_url)` | Dedup lúc ingest | |
+| PK/FK/UNIQUE SQLite (+ CHECK enums mới) | SQLite DDL | Enforce thật |
+| FK logic Parquet | DQ job | Không enforce trong Parquet |
+| current/: 1 dòng/product_id | **Writer + DQ R15** | Bất biến vật lý, không phụ thuộc query |
+| review identity | Ingest (method+confidence) + DQ | Không mặc định hash = ID |
+| `review_count >= 0`, `price > 0`, URL format | DQ R3/R4/R5 | |
